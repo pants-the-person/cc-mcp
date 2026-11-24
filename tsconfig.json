@@ -10,5 +10,9 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["worker-configuration.d.ts", "src/**/*.ts"]
+  "include": [
+    "worker-configuration.d.ts",
+    "src/**/*.ts",
+    "tests/worker/**/*.ts"
+  ]
 }

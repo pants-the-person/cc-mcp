@@ -9,21 +9,46 @@
   "observability": {
     "enabled": true
   },
+  "vars": {
+    "REQUIRE_CF_ACCESS": "true"
+  },
+  "rules": [
+    {
+      "type": "Text",
+      "globs": [
+        "**/*.lua"
+      ],
+      "fallthrough": true
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
-        "name": "CC_MCP_DO",
-        "class_name": "CcMcpObject"
+        "name": "BRIDGE_DO",
+        "class_name": "CcMeshBridge"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      // SQLite-backed Durable Objects are supported on the Cloudflare Workers Free plan
       "new_sqlite_classes": [
-        "CcMcpObject"
+        "CcMeshBridge"
       ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "CATALOG_DB",
+      "database_name": "cc-mesh-catalog",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACT_BUCKET",
+      "bucket_name": "cc-mesh-artifacts"
     }
   ]
 }
