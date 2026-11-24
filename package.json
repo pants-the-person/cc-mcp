@@ -9,13 +9,16 @@
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types",
     "test": "vitest run",
-    "test:worker": "vitest run tests/worker"
+    "test:worker": "vitest run tests/worker",
+    "test:lua": "node tests/lua/run_wasmoon.mjs",
+    "test:all": "npm run test:worker && npm run test:lua"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.23.0",
     "@cloudflare/workers-types": "latest",
     "typescript": "^5.8.0",
     "vitest": "^4.1.0",
+    "wasmoon": "^1.16.0",
     "wrangler": "^4.167.0"
   }
 }
