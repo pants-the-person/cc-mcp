@@ -9,6 +9,12 @@
   "observability": {
     "enabled": true
   },
+  "routes": [
+    {
+      "pattern": "cc.pants.place",
+      "custom_domain": true
+    }
+  ],
   "vars": {
     "REQUIRE_CF_ACCESS": "true"
   },
@@ -41,7 +47,7 @@
     {
       "binding": "CATALOG_DB",
       "database_name": "cc-mesh-catalog",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "b740905c-b6da-4c6c-a361-3860f17d92a8",
       "migrations_dir": "migrations"
     }
   ],

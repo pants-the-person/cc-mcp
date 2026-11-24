@@ -127,28 +127,56 @@ npm run test:all     # Run test:worker + test:lua + test:e2e
 
 ## Quick Setup & Deployment Checklist
 
-### 1. Provision Cloudflare Resources
-```bash
-# Create D1 database & R2 bucket
-npx wrangler d1 create cc-mesh-catalog
-npx wrangler r2 bucket create cc-mesh-artifacts
-```
-Update `d1_databases[0].database_id` in [`wrangler.jsonc`](wrangler.jsonc) with the returned D1 UUID, then apply migrations and deploy:
+### 1. Provisioned Cloudflare Resources (`cc.pants.place`)
+- **Custom Domain:** `https://cc.pants.place` (MCP endpoint: `https://cc.pants.place/mcp`)
+- **D1 Database:** `cc-mesh-catalog` (`b740905c-b6da-4c6c-a361-3860f17d92a8`)
+- **R2 Bucket:** `cc-mesh-artifacts`
+- **Durable Object:** `CcMeshBridge` (`v1` SQLite migration)
+
+To re-apply migrations or redeploy:
 ```bash
 npx wrangler d1 migrations apply CATALOG_DB --remote
 npm run deploy
 ```
 
-### 2. Configure Cloudflare Access
-1. Create a Cloudflare Access **Self-Hosted Application** protecting your Worker domain (e.g., `cc.example.com`).
-2. Add a **Bypass** policy specifically for path `/lua/bootstrap.lua` so fresh in-game computers can download it via `wget`.
-3. Create a **Service Auth** policy with a **Service Token** (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) for in-game CC: Tweaked gateways and MCP agents, plus an interactive OIDC policy (e.g., Authentik) for human access.
+### 2. Cloudflare Access Protection & Generating an Access Token
+`cc.pants.place` is protected by Cloudflare Access (`pants-place.cloudflareaccess.com`):
+- **`cc-mcp`** (`cc.pants.place`, covering `/mcp`, `/ws`, `/api/*`, `/lua/*`):
+  - **Service Auth** (`CC-Mesh Service Tokens`) — accepts any valid Cloudflare Access Service Token (`CF-Access-Client-Id` + `CF-Access-Client-Secret`).
+  - **Allow** (`Pants Place Auth (OIDC)`) — interactive login via OIDC.
+- **`cc-mcp-bootstrap`** (`cc.pants.place/lua/bootstrap.lua`):
+  - **Bypass** (`everyone`) — allows fresh in-game computers to fetch `startup.lua` via `wget`.
+
+#### Option A: Generate a Cloudflare Access Service Token (for CC: Tweaked & MCP clients)
+Create a Cloudflare API token with **Account → Access: Service Tokens → Edit** permission, export `CF_API_TOKEN`, and run:
+```bash
+curl -fsS -X POST "https://api.cloudflare.com/client/v4/accounts/ce75b366925251ef9100230d96370e49/access/service_tokens" \
+  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"cc-mcp-client","duration":"8760h"}' \
+  | jq -r '.result | "CF-Access-Client-Id: \(.client_id)\nCF-Access-Client-Secret: \(.client_secret)\nExpires: \(.expires_at)"'
+```
+> Save `client_secret` immediately — Cloudflare only returns it once at creation time.
+
+Register `cc-mcp` in Antigravity CLI using that Service Token:
+```bash
+agy mcp add \
+  --header "CF-Access-Client-Id: <CLIENT_ID>" \
+  --header "CF-Access-Client-Secret: <CLIENT_SECRET>" \
+  cc-mcp https://cc.pants.place/mcp
+```
+
+#### Option B: Generate a Short-Lived User Access JWT (via `cloudflared`)
+```bash
+cloudflared access login https://cc.pants.place/mcp
+cloudflared access token -app=https://cc.pants.place/mcp
+```
 
 ### 3. Bootstrap an In-Game CC: Tweaked Computer
 On your in-game **Gateway** computer (with a wired/ender modem and an optional redstone clock connected to the `back` side):
 ```lua
-wget https://cc.example.com/lua/bootstrap.lua startup.lua
-set mcp.url https://cc.example.com
+wget https://cc.pants.place/lua/bootstrap.lua startup.lua
+set mcp.url https://cc.pants.place
 set mcp.role gateway
 set mcp.world overworld
 set mcp.net main
@@ -160,8 +188,8 @@ reboot
 
 On **Runner / Turtle** nodes (connected via Rednet):
 ```lua
-wget https://cc.example.com/lua/bootstrap.lua startup.lua
-set mcp.url https://cc.example.com
+wget https://cc.pants.place/lua/bootstrap.lua startup.lua
+set mcp.url https://cc.pants.place
 set mcp.role runner
 set mcp.cf_id <your-cf-access-client-id>
 set mcp.cf_secret <your-cf-access-client-secret>
