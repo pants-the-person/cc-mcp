@@ -43,59 +43,76 @@ export interface DeviceApiSpecUpsertInput {
 // Network Topology, Tasks & Learned Tools (Durable Object SQLite)
 // ---------------------------------------------------------------------------
 
+export type EntityKind = "gateway" | "runner" | "turtle" | "peripheral" | "drive";
+
 export interface NetworkEntityInput {
-  entity_id?: string;
+  entity_key?: string;
   name: string;
-  kind: "gateway" | "worker" | "peripheral" | "computer";
+  kind?: EntityKind | "worker" | "computer";
+  type_name?: string;
   peripheral_type?: string;
+  type?: string;
   types?: string[];
   methods?: string[];
-  computer_id?: number;
-  label?: string;
-  parent_id?: string;
-  probe?: DeviceProbeData;
-  metadata?: Record<string, unknown>;
+  probe?: DeviceProbeData | Record<string, unknown> | null;
 }
 
-export interface NetworkEntity {
-  entity_id: string;
-  gateway_id: string;
+export interface NetworkEntityRow {
+  entity_key: string;
+  net_id: string;
+  kind: string;
   name: string;
-  kind: "gateway" | "worker" | "peripheral" | "computer";
-  type_name: string | null;
-  types_json: string;
+  type_name: string;
   methods_json: string;
   probe_json: string | null;
   spec_status: SpecStatus;
   last_seen: number;
-  metadata_json: string;
 }
 
-export type TaskStatus = "pending" | "leased" | "completed" | "failed" | "expired";
+export interface EnrichedNetworkEntity {
+  entity_key: string;
+  net_id: string;
+  kind: string;
+  name: string;
+  type_name: string;
+  methods: string[];
+  probe: Record<string, unknown> | null;
+  spec_status: SpecStatus;
+  last_seen: number;
+  spec: DeviceApiSpec | null;
+}
 
-export interface TaskRecord {
+export type TaskStatus = "pending" | "leased" | "completed" | "failed";
+
+export interface TaskQueueRow {
   task_id: string;
-  gateway_id: string;
-  target: string;
-  code: string;
+  net_id: string;
+  target_node: string;
+  tool_name: string | null;
+  lua_code: string;
   args_json: string;
+  priority: number;
   status: TaskStatus;
+  lease_ms: number;
   lease_expires_at: number | null;
-  attempts: number;
   created_at: number;
   updated_at: number;
 }
 
 export interface DispatchedTask {
   task_id: string;
-  target: string;
-  code: string;
+  net_id: string;
+  target_node: string;
+  tool_name: string | null;
+  lua_code: string;
   args: Record<string, unknown>;
+  priority: number;
+  lease_expires_at: number;
 }
 
-export interface TaskOutput {
+export interface TaskOutputRow {
   task_id: string;
-  ok: boolean;
+  ok: number;
   stdout: string;
   result_json: string | null;
   error: string | null;
@@ -103,23 +120,27 @@ export interface TaskOutput {
   expires_at: number;
 }
 
-export interface LearnedTool {
+export interface LearnedToolRow {
   name: string;
   description: string;
   input_schema_json: string;
-  lua_code: string;
-  default_target: string;
+  lua_template: string;
   builtin: number;
   created_at: number;
   updated_at: number;
 }
 
+export type WsRole = "gateway" | "mcp" | "client";
+
 export interface WsAttachment {
-  gatewayId: string;
+  role: WsRole;
   world: string;
-  connectedAt: number;
+  net: string;
+  clientId: string;
   subscriptions: string[];
+  connectedAt: number;
   label?: string;
+  supportsSampling?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +150,8 @@ export interface WsAttachment {
 export type ClientWsMessage =
   | {
       type: "SYNC_TOPOLOGY";
-      gateway_id: string;
+      net_id?: string;
+      gateway_id?: string;
       world?: string;
       label?: string;
       entities: NetworkEntityInput[];
@@ -137,54 +159,63 @@ export type ClientWsMessage =
     }
   | {
       type: "PERIPHERAL_ATTACHED";
-      gateway_id: string;
+      net_id?: string;
+      gateway_id?: string;
       name: string;
-      peripheral_type: string;
-      types?: string[];
-      methods: string[];
-      probe?: DeviceProbeData;
+      kind?: EntityKind;
+      type_name?: string;
+      peripheral_type?: string;
+      methods?: string[];
+      probe?: DeviceProbeData | Record<string, unknown>;
       timestamp?: number;
     }
   | {
       type: "PERIPHERAL_DETACHED";
-      gateway_id: string;
+      net_id?: string;
+      gateway_id?: string;
       name: string;
       timestamp?: number;
     }
   | {
       type: "POLL_QUEUE";
-      gateway_id: string;
+      net_id?: string;
+      gateway_id?: string;
+      capacity?: number;
       max_batch?: number;
     }
   | {
       type: "TASK_RESULT";
       task_id: string;
+      net_id?: string;
       gateway_id?: string;
       ok: boolean;
       stdout?: string;
       result?: unknown;
       error?: string;
+      ttl_ms?: number;
       duration_ms?: number;
     }
   | {
       type: "PUB";
       topic: string;
       payload: unknown;
-      sender?: string;
+      echo?: boolean;
     }
   | {
       type: "SUB";
-      topic: string;
+      topic?: string;
+      topics?: string[];
     }
   | {
       type: "UNSUB";
-      topic: string;
+      topic?: string;
+      topics?: string[];
     }
   | {
       type: "KV_SET";
       key: string;
       value: unknown;
-      ttl_seconds?: number;
+      request_id?: string;
     }
   | {
       type: "KV_GET";
@@ -195,11 +226,14 @@ export type ClientWsMessage =
 export type ServerWsMessage =
   | {
       type: "WAKE";
+      net_id: string;
+      task_id?: string;
       pending_count: number;
       reason?: string;
     }
   | {
       type: "DISPATCH_BATCH";
+      net_id: string;
       tasks: DispatchedTask[];
       has_more: boolean;
     }
@@ -207,14 +241,27 @@ export type ServerWsMessage =
       type: "EVENT";
       topic: string;
       payload: unknown;
-      sender?: string;
+      from_net: string;
+      sender: string;
       timestamp: number;
+    }
+  | {
+      type: "SUB_ACK";
+      topic?: string;
+      topics: string[];
+    }
+  | {
+      type: "KV_ACK";
+      key: string;
+      ok: boolean;
+      request_id?: string;
     }
   | {
       type: "KV_VALUE";
       key: string;
       value: unknown;
       found: boolean;
+      updated_at: number | null;
       request_id?: string;
     }
   | {
@@ -222,6 +269,7 @@ export type ServerWsMessage =
       ref_type: string;
       ok: boolean;
       detail?: string;
+      [key: string]: unknown;
     }
   | {
       type: "ERROR";

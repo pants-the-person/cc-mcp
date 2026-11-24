@@ -70,15 +70,28 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
       // Authenticated /mcp routes to CcMeshBridge DO
       const mcpRes = await exports.default.fetch(
         "https://cc-mcp.test/mcp?world=overworld",
-        { method: "POST", headers: AUTH_HEADERS },
+        {
+          method: "POST",
+          headers: { ...AUTH_HEADERS, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "stage1-auth-test", version: "1.0.0" },
+            },
+          }),
+        },
       );
       expect(mcpRes.status).toBe(200);
       const mcpBody = (await mcpRes.json()) as {
         jsonrpc: string;
-        result: { status: string };
+        result: { serverInfo: { name: string } };
       };
       expect(mcpBody.jsonrpc).toBe("2.0");
-      expect(mcpBody.result.status).toBe("stub");
+      expect(mcpBody.result.serverInfo.name).toBe("cc-mesh-bridge");
 
       // Authenticated non-upgrade /ws routes to CcMeshBridge DO (returns 426)
       const wsNoUpgradeRes = await exports.default.fetch(
