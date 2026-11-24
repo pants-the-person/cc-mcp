@@ -46,12 +46,14 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
         expect(res.status, `Expected 401 for ${path}`).toBe(401);
       }
 
-      const bootstrapRes = await exports.default.fetch(
-        "https://cc-mcp.test/lua/bootstrap.lua",
-      );
-      expect(bootstrapRes.status).toBe(200);
-      expect(bootstrapRes.headers.get("Content-Type")).toContain("text/plain");
-      expect(await bootstrapRes.text()).toBe(bootstrapLuaSource);
+      for (const publicPath of ["/init.lua", "/lua/bootstrap.lua"]) {
+        const bootstrapRes = await exports.default.fetch(
+          `https://cc-mcp.test${publicPath}`,
+        );
+        expect(bootstrapRes.status, `Expected 200 for ${publicPath}`).toBe(200);
+        expect(bootstrapRes.headers.get("Content-Type")).toContain("text/plain");
+        expect(await bootstrapRes.text()).toBe(bootstrapLuaSource);
+      }
     });
 
     it("accepts either Cf-Access-Jwt-Assertion or Cf-Access-Authenticated-User-Email", async () => {

@@ -951,7 +951,10 @@ export default {
     const { pathname } = url;
 
     // 1. Public unauthenticated bootstrap script (always accessible for CC wget)
-    if (pathname === "/lua/bootstrap.lua" && request.method === "GET") {
+    if (
+      (pathname === "/init.lua" || pathname === "/lua/bootstrap.lua") &&
+      request.method === "GET"
+    ) {
       const source = getCoreLuaFile("bootstrap.lua");
       if (source === null) {
         return Response.json({ error: "Bootstrap not found" }, { status: 404 });

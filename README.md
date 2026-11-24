@@ -68,7 +68,7 @@ A single-repository **Cloudflare Workers + Durable Objects (WebSocket Hibernatio
 | Route | Method | Auth | Purpose |
 | :--- | :--- | :--- | :--- |
 | `/` | `GET` | Public | Health check (`{ service: "cc-mesh-bridge", status: "ok" }`) |
-| `/lua/bootstrap.lua` | `GET` | Public | In-game `wget` bootstrap script |
+| `/init.lua`, `/lua/bootstrap.lua` | `GET` | Public | In-game `wget` bootstrap script (`wget https://cc.pants.place/init.lua startup.lua`) |
 | `/lua/manifest.json` | `GET` | CF Access | SHA-256 manifest of all bundled Lua files |
 | `/lua/:file`, `/lua/lib/std.lua` | `GET` | CF Access | Core Lua scripts & standard library |
 | `/lua/apps/:slug.lua` | `GET` | CF Access | Static Domain App Store Lua source (`spider`, `inv_mon`, `net_diag`) |
@@ -142,40 +142,41 @@ npm run deploy
 ### 2. Cloudflare Access Protection & Generating an Access Token
 `cc.pants.place` is protected by Cloudflare Access (`pants-place.cloudflareaccess.com`):
 - **`cc-mcp`** (`cc.pants.place`, covering `/mcp`, `/ws`, `/api/*`, `/lua/*`):
-  - **Service Auth** (`CC-Mesh Service Tokens`) — accepts any valid Cloudflare Access Service Token (`CF-Access-Client-Id` + `CF-Access-Client-Secret`).
-  - **Allow** (`Pants Place Auth (OIDC)`) — interactive login via OIDC.
-- **`cc-mcp-bootstrap`** (`cc.pants.place/lua/bootstrap.lua`):
+  - **Managed OAuth (`oauth_configuration.enabled = true`)** with Dynamic Client Registration enabled for MCP clients.
+  - **Allow** (`Admin & ComputerCraft Groups (OIDC)`) — restricted strictly to Authentik (`Pants' Place Auth`) users in the **`admin`** or **`computercraft`** OIDC groups.
+  - **Service Auth** — least-privilege policy bound strictly to your dedicated CC: Tweaked Service Token ID (created by `./scripts/mint-access-token.sh`).
+- **`cc-mcp-bootstrap`** (`cc.pants.place/init.lua` & `cc.pants.place/lua/bootstrap.lua`):
   - **Bypass** (`everyone`) — allows fresh in-game computers to fetch `startup.lua` via `wget`.
 
-#### Option A: Generate a Cloudflare Access Service Token (for CC: Tweaked & MCP clients)
-Create a Cloudflare API token with **Account → Access: Service Tokens → Edit** permission, export `CF_API_TOKEN`, and run:
+#### Option A: Connect MCP Clients Directly via Managed OAuth + Authentik (No Static Token Needed)
 ```bash
-curl -fsS -X POST "https://api.cloudflare.com/client/v4/accounts/ce75b366925251ef9100230d96370e49/access/service_tokens" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  --data '{"name":"cc-mcp-client","duration":"8760h"}' \
-  | jq -r '.result | "CF-Access-Client-Id: \(.client_id)\nCF-Access-Client-Secret: \(.client_secret)\nExpires: \(.expires_at)"'
+agy mcp add --type http cc-mcp https://cc.pants.place/mcp
 ```
-> Save `client_secret` immediately — Cloudflare only returns it once at creation time.
+Then run `/mcp` in Antigravity CLI to complete the Authentik browser login.
 
-Register `cc-mcp` in Antigravity CLI using that Service Token:
+#### Option B: Mint a Least-Privilege Service Token (Zero-Leak Local Script for CC: Tweaked)
+Create a least-privilege Cloudflare API token at https://dash.cloudflare.com/profile/api-tokens with ONLY:
+- **Account → Access: Service Tokens → Edit**
+- **Account → Access: Apps and Policies → Edit**
+
+Then run:
 ```bash
-agy mcp add \
-  --header "CF-Access-Client-Id: <CLIENT_ID>" \
-  --header "CF-Access-Client-Secret: <CLIENT_SECRET>" \
-  cc-mcp https://cc.pants.place/mcp
+CF_API_TOKEN="<your-cf-api-token>" ./scripts/mint-access-token.sh
 ```
+This writes `.cf-access.env` (`chmod 600`, gitignored) without ever printing `CF_ACCESS_CLIENT_SECRET`, and automatically creates a `non_identity` Service Auth policy on `cc.pants.place` scoped strictly to that single `token_id`.
 
-#### Option B: Generate a Short-Lived User Access JWT (via `cloudflared`)
+#### Option C: Generate a Short-Lived User Access JWT (via `cloudflared`)
 ```bash
 cloudflared access login https://cc.pants.place/mcp
 cloudflared access token -app=https://cc.pants.place/mcp
 ```
 
 ### 3. Bootstrap an In-Game CC: Tweaked Computer
+See [`docs/in-game-testing.md`](docs/in-game-testing.md) for the complete in-game verification checklist.
+
 On your in-game **Gateway** computer (with a wired/ender modem and an optional redstone clock connected to the `back` side):
 ```lua
-wget https://cc.pants.place/lua/bootstrap.lua startup.lua
+wget https://cc.pants.place/init.lua startup.lua
 set mcp.url https://cc.pants.place
 set mcp.role gateway
 set mcp.world overworld
@@ -188,7 +189,7 @@ reboot
 
 On **Runner / Turtle** nodes (connected via Rednet):
 ```lua
-wget https://cc.pants.place/lua/bootstrap.lua startup.lua
+wget https://cc.pants.place/init.lua startup.lua
 set mcp.url https://cc.pants.place
 set mcp.role runner
 set mcp.cf_id <your-cf-access-client-id>

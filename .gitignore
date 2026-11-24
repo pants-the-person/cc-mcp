@@ -5,6 +5,11 @@
 .env
 .env.*
 !.env.example
+.cf-access.env
+.cf-access.ini
+*.secret.env
+*.secret.ini
+.secrets/
 .certs/
 *.pem
 *.key
