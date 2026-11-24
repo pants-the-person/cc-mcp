@@ -1,0 +1,21 @@
+# Secrets and local environment
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+.certs/
+*.pem
+*.key
+
+# Node & Wrangler
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
