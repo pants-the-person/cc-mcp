@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:worker": "vitest run tests/worker",
     "test:lua": "node tests/lua/run_wasmoon.mjs",
-    "test:all": "npm run test:worker && npm run test:lua"
+    "test:e2e": "node tests/e2e/live_wrangler_e2e.mjs",
+    "test:all": "npm run test:worker && npm run test:lua && npm run test:e2e"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.23.0",
