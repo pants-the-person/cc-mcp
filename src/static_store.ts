@@ -3,9 +3,13 @@ import gatewayLua from "./lua/gateway.lua";
 import runnerLua from "./lua/runner.lua";
 import pkgLua from "./lua/pkg.lua";
 import stdLua from "./lua/lib/std.lua";
+import cryptoLua from "./lua/lib/crypto.lua";
+import meshLua from "./lua/lib/mesh.lua";
 import spiderLua from "./lua/apps/spider.lua";
 import invMonLua from "./lua/apps/inv_mon.lua";
 import netDiagLua from "./lua/apps/net_diag.lua";
+import meshSetupLua from "./lua/apps/mesh_setup.lua";
+import subnetBridgeLua from "./lua/apps/subnet_bridge.lua";
 import type { StaticAppEntry } from "./protocol";
 
 const textEncoder = new TextEncoder();
@@ -52,6 +56,20 @@ const STATIC_APPS: readonly StaticAppDefinition[] = [
       "Inspects attached peripherals, Rednet peers, and device API method tables using lib.std.",
     source: netDiagLua,
   },
+  {
+    slug: "mesh_setup",
+    title: "Encrypted Multi-Subnet Mesh Setup & Floppy Builder",
+    description:
+      "Scans for an unused random modem channel, generates a 256-bit HMAC-SHA256 encryption key, and builds a Subnet Join Installer floppy disk.",
+    source: meshSetupLua,
+  },
+  {
+    slug: "subnet_bridge",
+    title: "Encrypted Multi-Subnet Peripheral Bridge",
+    description:
+      "Dual-homed wired <-> ender/wireless bridge exposing local peripherals as remote proxies (e.g. net.main_nether.storage_0.list()).",
+    source: subnetBridgeLua,
+  },
 ];
 
 const CORE_LUA_FILES: Readonly<Record<string, string>> = {
@@ -60,6 +78,8 @@ const CORE_LUA_FILES: Readonly<Record<string, string>> = {
   "runner.lua": runnerLua,
   "pkg.lua": pkgLua,
   "lib/std.lua": stdLua,
+  "lib/crypto.lua": cryptoLua,
+  "lib/mesh.lua": meshLua,
 };
 
 const staticAppBySlug = new Map<string, StaticAppDefinition>(

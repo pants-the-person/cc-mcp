@@ -113,7 +113,7 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
       await waitOnExecutionContext(ctx);
       expect(res.status).toBe(200);
       const body = (await res.json()) as StaticStoreResponse;
-      expect(body.apps.length).toBe(3);
+      expect(body.apps.length).toBe(5);
     });
   });
 
@@ -127,7 +127,13 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
       const data = (await storeRes.json()) as StaticStoreResponse;
 
       const slugs = data.apps.map((a) => a.slug).sort();
-      expect(slugs).toEqual(["inv_mon", "net_diag", "spider"]);
+      expect(slugs).toEqual([
+        "inv_mon",
+        "mesh_setup",
+        "net_diag",
+        "spider",
+        "subnet_bridge",
+      ]);
 
       for (const app of data.apps) {
         expect(app.sha256).toMatch(SHA256_HEX_RE);
@@ -169,9 +175,13 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
         "runner.lua",
         "pkg.lua",
         "lib/std.lua",
+        "lib/crypto.lua",
+        "lib/mesh.lua",
         "apps/spider.lua",
         "apps/inv_mon.lua",
         "apps/net_diag.lua",
+        "apps/mesh_setup.lua",
+        "apps/subnet_bridge.lua",
       ]) {
         expect(manifest[key], `Missing manifest entry ${key}`).toMatch(
           SHA256_HEX_RE,

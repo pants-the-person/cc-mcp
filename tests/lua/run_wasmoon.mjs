@@ -6,6 +6,8 @@ const ROOT = resolve(process.cwd());
 
 const FILES_TO_MOUNT = [
   "src/lua/lib/std.lua",
+  "src/lua/lib/crypto.lua",
+  "src/lua/lib/mesh.lua",
   "src/lua/bootstrap.lua",
   "src/lua/gateway.lua",
   "src/lua/runner.lua",
@@ -13,6 +15,8 @@ const FILES_TO_MOUNT = [
   "src/lua/apps/spider.lua",
   "src/lua/apps/inv_mon.lua",
   "src/lua/apps/net_diag.lua",
+  "src/lua/apps/mesh_setup.lua",
+  "src/lua/apps/subnet_bridge.lua",
   "tests/lua/mock_cc.lua",
   "tests/lua/run_lua_tests.lua",
 ];

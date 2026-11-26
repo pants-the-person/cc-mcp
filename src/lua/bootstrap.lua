@@ -186,9 +186,11 @@ local function sync_and_boot()
         end
       end
 
-      -- Build ordered sync list: core stdlib, pkg CLI, role script (+ runner on gateway)
+      -- Build ordered sync list: core libs, pkg CLI, role script (+ runner on gateway)
       local sync_targets = {
         { key = "lib/std.lua", dest = "/lib/std.lua" },
+        { key = "lib/crypto.lua", dest = "/lib/crypto.lua" },
+        { key = "lib/mesh.lua", dest = "/lib/mesh.lua" },
         { key = "pkg.lua", dest = "/pkg.lua" },
         { key = role .. ".lua", dest = "/" .. role .. ".lua" },
       }

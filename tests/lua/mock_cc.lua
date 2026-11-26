@@ -1127,6 +1127,45 @@ function mock_cc.new_world()
     self:pump()
   end
 
+  world.modem_buses = {}
+
+  function world:attach_bus_modem(comp, side, bus_name, is_wireless)
+    local bus = self.modem_buses[bus_name]
+    if not bus then
+      bus = {}
+      self.modem_buses[bus_name] = bus
+    end
+    local open_channels = {}
+    local entry = {
+      comp = comp,
+      side = side,
+      bus = bus_name,
+      is_wireless = is_wireless == true,
+      open_channels = open_channels,
+    }
+    bus[#bus + 1] = entry
+
+    comp:attach_peripheral(side, { "modem" }, {
+      isWireless = function() return is_wireless == true end,
+      open = function(ch) open_channels[ch] = true end,
+      close = function(ch) open_channels[ch] = nil end,
+      closeAll = function()
+        for k in pairs(open_channels) do open_channels[k] = nil end
+      end,
+      isOpen = function(ch) return open_channels[ch] == true end,
+      transmit = function(ch, reply_ch, payload)
+        local cloned = deep_copy(payload)
+        for i = 1, #bus do
+          local peer = bus[i]
+          if peer ~= entry and peer.open_channels[ch] then
+            peer.comp:queue_event("modem_message", peer.side, ch, reply_ch, deep_copy(cloned), 1)
+          end
+        end
+      end,
+    })
+    return entry
+  end
+
   return world
 end
 

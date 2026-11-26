@@ -47,14 +47,18 @@ local function run_test(name, fn)
 end
 
 -- Preload source files from repo
-local SRC_STD       = mock_cc.read_disk_file("src/lua/lib/std.lua")
-local SRC_BOOTSTRAP = mock_cc.read_disk_file("src/lua/bootstrap.lua")
-local SRC_GATEWAY   = mock_cc.read_disk_file("src/lua/gateway.lua")
-local SRC_RUNNER    = mock_cc.read_disk_file("src/lua/runner.lua")
-local SRC_PKG       = mock_cc.read_disk_file("src/lua/pkg.lua")
-local SRC_SPIDER    = mock_cc.read_disk_file("src/lua/apps/spider.lua")
-local SRC_INV_MON   = mock_cc.read_disk_file("src/lua/apps/inv_mon.lua")
-local SRC_NET_DIAG  = mock_cc.read_disk_file("src/lua/apps/net_diag.lua")
+local SRC_STD           = mock_cc.read_disk_file("src/lua/lib/std.lua")
+local SRC_CRYPTO        = mock_cc.read_disk_file("src/lua/lib/crypto.lua")
+local SRC_MESH          = mock_cc.read_disk_file("src/lua/lib/mesh.lua")
+local SRC_BOOTSTRAP     = mock_cc.read_disk_file("src/lua/bootstrap.lua")
+local SRC_GATEWAY       = mock_cc.read_disk_file("src/lua/gateway.lua")
+local SRC_RUNNER        = mock_cc.read_disk_file("src/lua/runner.lua")
+local SRC_PKG           = mock_cc.read_disk_file("src/lua/pkg.lua")
+local SRC_SPIDER        = mock_cc.read_disk_file("src/lua/apps/spider.lua")
+local SRC_INV_MON       = mock_cc.read_disk_file("src/lua/apps/inv_mon.lua")
+local SRC_NET_DIAG      = mock_cc.read_disk_file("src/lua/apps/net_diag.lua")
+local SRC_MESH_SETUP    = mock_cc.read_disk_file("src/lua/apps/mesh_setup.lua")
+local SRC_SUBNET_BRIDGE = mock_cc.read_disk_file("src/lua/apps/subnet_bridge.lua")
 
 -- ===========================================================================
 -- Test 1: std.serialize_json (nested tables, functions, non-finite, circular)
@@ -861,6 +865,255 @@ run_test("pkg.lua schematics list/install/publish and std.serialize_json pure-Lu
   assert_eq(roundtrip.a, 1, "fallback JSON number")
   assert_eq(roundtrip.b[2], "y", "fallback JSON array")
   assert_eq(roundtrip.f, nil, "fallback JSON stripped function")
+end)
+
+-- ===========================================================================
+-- Test 10: lib/crypto.lua (FIPS SHA-256, RFC HMAC-SHA256, Authenticated Seal/Open)
+-- ===========================================================================
+run_test("lib/crypto.lua passes FIPS SHA-256, RFC HMAC-SHA256, and rejects tampered/wrong-key frames", function()
+  local world = mock_cc.new_world()
+  local comp = world:new_computer({ id = 10, label = "crypto_test" })
+  comp:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  local crypto = comp.env.require("lib.crypto")
+
+  -- Standard FIPS 180-4 SHA-256 vectors
+  assert_eq(
+    crypto.sha256_hex(""),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "SHA-256 empty string"
+  )
+  assert_eq(
+    crypto.sha256_hex("abc"),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "SHA-256 'abc'"
+  )
+
+  -- Standard RFC 2104 HMAC-SHA256 vector
+  assert_eq(
+    crypto.hmac_sha256_hex("key", "The quick brown fox jumps over the lazy dog"),
+    "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+    "HMAC-SHA256 RFC vector"
+  )
+
+  -- Authenticated encryption round-trip + tamper/wrong-key/wrong-AAD rejection
+  local key = crypto.random_hex(32, "test_seed")
+  assert_eq(#key, 64, "256-bit hex key length")
+  local env, err = crypto.seal(key, '{"hello":"nether","count":42}', "main:44123")
+  assert_eq(err, nil, "seal succeeded")
+  assert_eq(env.v, 1, "envelope version 1")
+
+  local pt, oerr = crypto.open(key, env, "main:44123")
+  assert_eq(oerr, nil, "open succeeded")
+  assert_eq(pt, '{"hello":"nether","count":42}', "decrypted plaintext matches")
+
+  -- Wrong key fails
+  local bad_pt, bad_err = crypto.open("wrong_key_0000", env, "main:44123")
+  assert_eq(bad_pt, nil, "wrong key rejected")
+  assert_contains(bad_err, "authentication failed", "wrong key error message")
+
+  -- Wrong AAD fails
+  local aad_pt = crypto.open(key, env, "main:99999")
+  assert_eq(aad_pt, nil, "wrong channel/mesh AAD rejected")
+
+  -- Tampered ciphertext fails
+  local tampered = { v = env.v, n = env.n, t = env.t, c = (env.c:sub(1, 2) == "00" and "ff" or "00") .. env.c:sub(3) }
+  local t_pt = crypto.open(key, tampered, "main:44123")
+  assert_eq(t_pt, nil, "tampered ciphertext rejected")
+end)
+
+-- ===========================================================================
+-- Test 11: lib/mesh.lua Encrypted Multi-Subnet Relay (farm PC -> main bridge -> nether bridge -> storage_0)
+-- ===========================================================================
+run_test("lib/mesh.lua proxies net.main_nether.storage_0.list() across dual-homed wired<->ender bridges with encryption", function()
+  local world = mock_cc.new_world()
+  local MESH_CH = 42777
+  local MESH_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+  -- 1. Compute-farm PC on 'main' (ONLY wired modem on wired_main — NO ender modem!)
+  local farm_pc = world:new_computer({ id = 101, label = "farm_pc_1" })
+  farm_pc:write_vfs("/lib/std.lua", SRC_STD)
+  farm_pc:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  farm_pc:write_vfs("/lib/mesh.lua", SRC_MESH)
+  world:attach_bus_modem(farm_pc, "left", "wired_main", false)
+
+  -- 2. Dual-homed bridge on 'main' (wired_main + ender_global)
+  local main_bridge = world:new_computer({ id = 102, label = "bridge_main" })
+  main_bridge:write_vfs("/lib/std.lua", SRC_STD)
+  main_bridge:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  main_bridge:write_vfs("/lib/mesh.lua", SRC_MESH)
+  main_bridge:write_vfs("/.mesh_net.json", mock_cc.json_encode({
+    mesh_name = "main", subnet = "main", role = "bridge", channel = MESH_CH, key = MESH_KEY, ttl = 4,
+  }))
+  world:attach_bus_modem(main_bridge, "left", "wired_main", false)
+  world:attach_bus_modem(main_bridge, "bottom", "ender_global", true)
+
+  -- 3. Remote Nether bridge on 'main_nether' (ender_global + local storage_0 peripheral)
+  local nether_bridge = world:new_computer({ id = 103, label = "bridge_main_nether" })
+  nether_bridge:write_vfs("/lib/std.lua", SRC_STD)
+  nether_bridge:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  nether_bridge:write_vfs("/lib/mesh.lua", SRC_MESH)
+  nether_bridge:write_vfs("/.mesh_net.json", mock_cc.json_encode({
+    mesh_name = "main", subnet = "main_nether", role = "bridge", channel = MESH_CH, key = MESH_KEY, ttl = 4,
+  }))
+  world:attach_bus_modem(nether_bridge, "bottom", "ender_global", true)
+  local storage_calls = 0
+  nether_bridge:attach_peripheral("storage_0", { "minecraft:chest", "inventory" }, {
+    list = function()
+      storage_calls = storage_calls + 1
+      return {
+        [1] = { name = "minecraft:ancient_debris", count = 12 },
+        [2] = { name = "minecraft:blaze_rod", count = 64 },
+      }
+    end,
+    getDimensions = function()
+      return 27, 9
+    end,
+  })
+
+  -- Start both subnet bridges
+  main_bridge:start_daemon(SRC_SUBNET_BRIDGE, "subnet_bridge_main.lua")
+  nether_bridge:start_daemon(SRC_SUBNET_BRIDGE, "subnet_bridge_nether.lua")
+  world:pump()
+
+  -- From farm_pc_1 (wired-only!), discover mesh & invoke net.main_nether.storage_0.list()!
+  local rpc_result = farm_pc:run_script([[
+    local mesh = require("lib.mesh")
+    local net = mesh.connect({
+      mesh_name = "main",
+      subnet = "main",
+      channel = 42777,
+      key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      timeout = 1.0,
+    })
+    local topo = net._discover(0.2)
+    local items = net.main_nether.storage_0.list()
+    local w, h = net.main_nether.storage_0.getDimensions()
+    local ptype = net.main_nether.storage_0.getType()
+    return { topo = topo, items = items, w = w, h = h, ptype = ptype }
+  ]], "farm_client.lua")
+
+  assert_true(rpc_result.topo.main_nether ~= nil, "discovered main_nether across dual-homed relay")
+  assert_true(rpc_result.topo.main_nether.peripherals.storage_0 ~= nil, "discovered storage_0 on main_nether")
+  assert_eq(rpc_result.items[1].name, "minecraft:ancient_debris", "remote list() item 1")
+  assert_eq(rpc_result.items[1].count, 12, "remote list() item 1 count")
+  assert_eq(rpc_result.items[2].name, "minecraft:blaze_rod", "remote list() item 2")
+  assert_eq(rpc_result.w, 27, "multi-return value 1")
+  assert_eq(rpc_result.h, 9, "multi-return value 2")
+  assert_eq(rpc_result.ptype, "minecraft:chest", "remote getType()")
+  assert_eq(storage_calls, 1, "storage_0.list() executed once")
+
+  -- Attacker on ender_global with wrong key MUST fail and NOT execute storage_0.list()
+  local attacker = world:new_computer({ id = 199, label = "attacker" })
+  attacker:write_vfs("/lib/std.lua", SRC_STD)
+  attacker:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  attacker:write_vfs("/lib/mesh.lua", SRC_MESH)
+  world:attach_bus_modem(attacker, "bottom", "ender_global", true)
+
+  local att_ok = pcall(function()
+    attacker:run_script([[
+      local mesh = require("lib.mesh")
+      local net = mesh.connect({
+        mesh_name = "main",
+        subnet = "evil",
+        channel = 42777,
+        key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        timeout = 0.15,
+      })
+      net.main_nether.storage_0.list()
+    ]], "attacker.lua")
+  end)
+  assert_eq(att_ok, false, "wrong-key attacker RPC rejected/timed out")
+  assert_eq(storage_calls, 1, "attacker did NOT invoke storage_0.list()")
+
+  -- Channel scanner skips busy channel 22222 and picks quiet channel 33333
+  local scanner = world:new_computer({ id = 104, label = "scanner" })
+  scanner:write_vfs("/lib/std.lua", SRC_STD)
+  scanner:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  scanner:write_vfs("/lib/mesh.lua", SRC_MESH)
+  world:attach_bus_modem(scanner, "bottom", "scan_bus", true)
+  -- Pre-queue foreign traffic on channel 22222
+  scanner:queue_event("modem_message", "bottom", 22222, 22222, "foreign_noise", 10)
+  local chosen_ch = scanner:run_script([[
+    local mesh = require("lib.mesh")
+    local ch, quiet = mesh.scan_quiet_channel({
+      candidates = { 22222, 33333 },
+      listen_s = 0.1,
+    })
+    return { ch = ch, quiet = quiet }
+  ]], "scan_test.lua")
+  assert_eq(chosen_ch.ch, 33333, "skipped busy channel 22222 and selected quiet 33333")
+  assert_eq(chosen_ch.quiet, true, "selected channel confirmed quiet")
+end)
+
+-- ===========================================================================
+-- Test 12: apps/mesh_setup.lua Floppy Disk Installer + Remote Nether Subnet Join
+-- ===========================================================================
+run_test("apps/mesh_setup.lua generates encrypted floppy installer and joins remote main_nether subnet", function()
+  local world = mock_cc.new_world()
+  local main_pc = world:new_computer({ id = 201, label = "main_admin" })
+  main_pc:write_vfs("/lib/std.lua", SRC_STD)
+  main_pc:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  main_pc:write_vfs("/lib/mesh.lua", SRC_MESH)
+  main_pc:write_vfs("/subnet_bridge.lua", SRC_SUBNET_BRIDGE)
+  world:attach_bus_modem(main_pc, "bottom", "ender_setup", true)
+
+  local disk_label = nil
+  main_pc:attach_peripheral("right", { "drive" }, {
+    isDiskPresent = function() return true end,
+    hasData = function() return true end,
+    getMountPath = function() return "disk" end,
+    getDiskLabel = function() return disk_label end,
+    setDiskLabel = function(lbl) disk_label = lbl end,
+  })
+
+  -- Run mesh_setup on 'main' to generate randomized channel + 256-bit key + floppy installer
+  local setup_cfg = main_pc:run_script(
+    SRC_MESH_SETUP, "mesh_setup.lua",
+    "--mesh", "main",
+    "--subnet", "main",
+    "--drive", "right",
+    "--listen", "0",
+    "--non-interactive"
+  )
+
+  assert_eq(setup_cfg.mesh_name, "main", "mesh_name saved")
+  assert_true(setup_cfg.channel >= 10000 and setup_cfg.channel <= 65000, "randomized channel in 10000..65000")
+  assert_eq(#setup_cfg.key, 64, "64-hex-char 256-bit key generated")
+  assert_eq(disk_label, "CC-Mesh Join (main)", "floppy disk labeled")
+  assert_true(main_pc:read_vfs("/disk/install.lua") ~= nil, "floppy install.lua created")
+  assert_true(main_pc:read_vfs("/disk/startup.lua") ~= nil, "floppy startup.lua created")
+  assert_true(main_pc:read_vfs("/disk/mesh_join.json") ~= nil, "floppy mesh_join.json created")
+  assert_true(main_pc:read_vfs("/disk/payload/lib/crypto.lua") ~= nil, "floppy payload crypto.lua copied")
+  assert_true(main_pc:read_vfs("/disk/payload/lib/mesh.lua") ~= nil, "floppy payload mesh.lua copied")
+  assert_true(main_pc:read_vfs("/disk/payload/subnet_bridge.lua") ~= nil, "floppy payload subnet_bridge.lua copied")
+
+  -- Move floppy to a brand-new Nether computer and run /disk/install.lua
+  local nether_pc = world:new_computer({ id = 202, label = nil })
+  for path, content in pairs(main_pc.vfs_files) do
+    if path:sub(1, 5) == "disk/" then
+      nether_pc:write_vfs("/" .. path, content)
+    end
+  end
+  -- Ensure shell.getRunningProgram returns "disk/install.lua"
+  nether_pc.env.shell.getRunningProgram = function() return "disk/install.lua" end
+
+  nether_pc:run_script(
+    nether_pc:read_vfs("/disk/install.lua"), "disk/install.lua",
+    "--subnet", "main_nether",
+    "--role", "bridge",
+    "--no-start"
+  )
+
+  local nether_cfg = mock_cc.json_decode(nether_pc:read_vfs("/.mesh_net.json"))
+  assert_eq(nether_cfg.mesh_name, "main", "nether joined mesh 'main'")
+  assert_eq(nether_cfg.subnet, "main_nether", "nether subnet set to 'main_nether'")
+  assert_eq(nether_cfg.channel, setup_cfg.channel, "nether inherited exact randomized channel")
+  assert_eq(nether_cfg.key, setup_cfg.key, "nether inherited exact encryption key")
+  assert_eq(nether_cfg.role, "bridge", "nether role set to bridge")
+  assert_true(nether_pc:read_vfs("/lib/crypto.lua") ~= nil, "nether installed /lib/crypto.lua")
+  assert_true(nether_pc:read_vfs("/lib/mesh.lua") ~= nil, "nether installed /lib/mesh.lua")
+  assert_true(nether_pc:read_vfs("/subnet_bridge.lua") ~= nil, "nether installed /subnet_bridge.lua")
+  assert_contains(nether_pc:read_vfs("/startup.lua"), "subnet_bridge.lua", "nether /startup.lua auto-starts bridge")
 end)
 
 -- ===========================================================================
