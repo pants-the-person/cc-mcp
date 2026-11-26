@@ -3,6 +3,17 @@
 -- using SHA-256 manifest verification and Cloudflare Access Service Token headers.
 
 local MANIFEST_PATH = "/.mesh_manifest"
+local DEFAULT_BASE_URL = "https://cc.pants.place"
+local CLI_ARGS = { ... }
+
+local function has_flag(flag)
+  for i = 1, #CLI_ARGS do
+    if CLI_ARGS[i] == flag then
+      return true
+    end
+  end
+  return false
+end
 
 local function get_setting(primary, fallback, default_val)
   if type(settings) == "table" and type(settings.get) == "function" then
@@ -18,6 +29,35 @@ local function get_setting(primary, fallback, default_val)
     end
   end
   return default_val
+end
+
+local function set_setting(key, value)
+  if type(settings) == "table" and type(settings.set) == "function" then
+    settings.set(key, value)
+  end
+end
+
+local function save_settings()
+  if type(settings) == "table" and type(settings.save) == "function" then
+    settings.save()
+  end
+end
+
+local function prompt_value(label, default_val, secret)
+  local suffix = (default_val and default_val ~= "" and not secret)
+    and (" [" .. tostring(default_val) .. "]: ")
+    or ": "
+  if type(write) == "function" then
+    write(label .. suffix)
+  else
+    print(label .. suffix)
+  end
+  local input = secret and read("*") or read()
+  input = tostring(input or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if input == "" then
+    return default_val or ""
+  end
+  return input
 end
 
 local function build_headers(cf_id, cf_secret)
@@ -70,18 +110,61 @@ local function http_get_text(url, headers)
 end
 
 local function sync_and_boot()
+  local reconfigure = has_flag("--reconfigure")
   local base_url = get_setting("mcp.url", "cc_mesh.url", "")
+  local cf_id = get_setting("mcp.cf_id", "cc_mesh.cf_id", "")
+  local cf_secret = get_setting("mcp.cf_secret", "cc_mesh.cf_secret", "")
+  local role = get_setting("mcp.role", "cc_mesh.role", "")
+
+  local needs_setup = reconfigure
+    or (type(base_url) ~= "string" or base_url == "")
+    or (type(cf_id) ~= "string" or cf_id == "")
+    or (type(cf_secret) ~= "string" or cf_secret == "")
+
+  if needs_setup and type(read) == "function" then
+    print("=== cc-mesh-bridge First-Time Setup ===")
+    base_url = prompt_value("Server URL", (type(base_url) == "string" and base_url ~= "") and base_url or DEFAULT_BASE_URL, false)
+    role = prompt_value("Role (gateway/runner)", (type(role) == "string" and role ~= "") and role or "gateway", false)
+    if role == "gateway" then
+      local world = prompt_value("World", get_setting("mcp.world", "cc_mesh.world", "overworld"), false)
+      local net = prompt_value("Net ID", get_setting("mcp.net", "cc_mesh.net", "main"), false)
+      local clock_side = prompt_value("Redstone clock side", get_setting("mcp.clock_side", "cc_mesh.clock_side", "back"), false)
+      set_setting("mcp.world", world)
+      set_setting("mcp.net", net)
+      set_setting("mcp.clock_side", clock_side)
+    end
+    cf_id = prompt_value("CF-Access-Client-Id", (type(cf_id) == "string" and cf_id ~= "") and cf_id or "", false)
+    local new_secret = prompt_value("CF-Access-Client-Secret (leave blank to keep)", "", true)
+    if new_secret ~= "" then
+      cf_secret = new_secret
+    end
+    set_setting("mcp.url", base_url)
+    set_setting("mcp.role", role)
+    set_setting("mcp.cf_id", cf_id)
+    set_setting("mcp.cf_secret", cf_secret)
+    save_settings()
+    print("[bootstrap] Saved settings to /.settings")
+  end
+
   if type(base_url) ~= "string" or base_url == "" then
-    print("[bootstrap] Error: set mcp.url (or cc_mesh.url) via `set mcp.url https://...`")
-    return false
+    base_url = DEFAULT_BASE_URL
+    set_setting("mcp.url", base_url)
+    save_settings()
+    print("[bootstrap] Defaulted mcp.url to " .. base_url)
   end
   base_url = base_url:gsub("/+$", "")
 
-  local cf_id = get_setting("mcp.cf_id", "cc_mesh.cf_id", nil)
-  local cf_secret = get_setting("mcp.cf_secret", "cc_mesh.cf_secret", nil)
-  local role = get_setting("mcp.role", "cc_mesh.role", "runner")
   if type(role) ~= "string" or role == "" then
     role = "runner"
+  end
+
+  -- If launched via `wget run https://cc.pants.place/init.lua`, persist /startup.lua automatically
+  if not fs.exists("/startup.lua") then
+    local boot_src = http_get_text(base_url .. "/init.lua", {})
+    if boot_src and boot_src ~= "" then
+      write_file("/startup.lua", boot_src)
+      print("[bootstrap] Installed /startup.lua")
+    end
   end
 
   local headers = build_headers(cf_id, cf_secret)
