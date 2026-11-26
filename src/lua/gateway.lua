@@ -65,6 +65,168 @@ local function is_modem(name)
   return false
 end
 
+local RUNNER_DISK_LABEL = "CC-Mesh Runner Installer"
+
+local DISK_INSTALLER_STARTUP = [[-- CC-Mesh Auto-Runner Installer Floppy
+-- Safety guard: NEVER hijack a gateway/bridge computer!
+local role = (type(settings) == "table" and (settings.get("mcp.role") or settings.get("cc_mesh.role"))) or ""
+if role == "gateway" then
+  if fs.exists("/startup.lua") then
+    return shell.run("/startup.lua")
+  end
+  return
+end
+
+local running = (type(shell) == "table" and type(shell.getRunningProgram) == "function")
+  and shell.getRunningProgram()
+  or "disk/startup.lua"
+local disk_dir = "/" .. fs.getDir(running)
+
+local function copy_file(src, dst)
+  if not fs.exists(src) then return false end
+  local d = fs.getDir(dst)
+  if d ~= "" and not fs.exists(d) then fs.makeDir(d) end
+  if fs.exists(dst) then fs.delete(dst) end
+  fs.copy(src, dst)
+  return true
+end
+
+print("[cc-mesh] Installing runner from " .. disk_dir .. "...")
+copy_file(fs.combine(disk_dir, "payload/lib/std.lua"), "/lib/std.lua")
+copy_file(fs.combine(disk_dir, "payload/runner.lua"), "/runner.lua")
+copy_file(fs.combine(disk_dir, "payload/pkg.lua"), "/pkg.lua")
+copy_file(fs.combine(disk_dir, "payload/bootstrap.lua"), "/startup.lua")
+
+local cfg_path = fs.combine(disk_dir, "mesh_config.json")
+if fs.exists(cfg_path) then
+  local f = fs.open(cfg_path, "r")
+  if f then
+    local cfg = textutils.unserialiseJSON(f.readAll() or "")
+    f.close()
+    if type(cfg) == "table" and type(settings) == "table" then
+      if type(cfg.url) == "string" and cfg.url ~= "" then settings.set("mcp.url", cfg.url) end
+      if type(cfg.cf_id) == "string" and cfg.cf_id ~= "" then settings.set("mcp.cf_id", cfg.cf_id) end
+      if type(cfg.cf_secret) == "string" and cfg.cf_secret ~= "" then settings.set("mcp.cf_secret", cfg.cf_secret) end
+      if type(cfg.world) == "string" and cfg.world ~= "" then settings.set("mcp.world", cfg.world) end
+      if type(cfg.net) == "string" and cfg.net ~= "" then settings.set("mcp.net", cfg.net) end
+    end
+  end
+end
+
+if type(settings) == "table" then
+  settings.set("mcp.role", "runner")
+  settings.save()
+end
+
+if type(os.getComputerLabel) == "function" and not os.getComputerLabel() and type(os.setComputerLabel) == "function" then
+  local prefix = (turtle ~= nil) and "turtle_" or "runner_"
+  os.setComputerLabel(prefix .. tostring(os.getComputerID()))
+end
+
+print("[cc-mesh] Runner installed! Starting /runner.lua...")
+if fs.exists("/runner.lua") then
+  shell.run("/runner.lua")
+elseif fs.exists("/startup.lua") then
+  shell.run("/startup.lua")
+end
+]]
+
+local function copy_to_disk(src, dst)
+  if type(fs) ~= "table" or not fs.exists(src) then
+    return false
+  end
+  local dir = fs.getDir(dst)
+  if dir and dir ~= "" and not fs.exists(dir) then
+    fs.makeDir(dir)
+  end
+  local rf = fs.open(src, "r")
+  if not rf then return false end
+  local data = rf.readAll()
+  rf.close()
+  local wf = fs.open(dst, "w")
+  if not wf then return false end
+  wf.write(data or "")
+  wf.close()
+  return true
+end
+
+local function provision_runner_disk(drive_name, cfg)
+  if type(peripheral) ~= "table" or type(fs) ~= "table" then
+    return false
+  end
+  if peripheral.getType(drive_name) ~= "drive" then
+    return false
+  end
+  local ok_pres, present = pcall(peripheral.call, drive_name, "isDiskPresent")
+  local ok_data, has_data = pcall(peripheral.call, drive_name, "hasData")
+  if not (ok_pres and present and ok_data and has_data) then
+    return false
+  end
+  local ok_mp, mount_path = pcall(peripheral.call, drive_name, "getMountPath")
+  if not (ok_mp and type(mount_path) == "string" and mount_path ~= "") then
+    return false
+  end
+  local ok_lbl, disk_label = pcall(peripheral.call, drive_name, "getDiskLabel")
+  local root = "/" .. mount_path:gsub("^/+", "")
+  local existing = fs.exists(root) and fs.list(root) or {}
+
+  -- Safety: only write to empty disks or disks already labeled as our Runner Installer
+  if #existing > 0 and (not ok_lbl or disk_label ~= RUNNER_DISK_LABEL) then
+    return false
+  end
+
+  -- Need runner payload present on gateway
+  if not fs.exists("/runner.lua") or not fs.exists("/lib/std.lua") then
+    return false
+  end
+
+  copy_to_disk("/lib/std.lua", fs.combine(root, "payload/lib/std.lua"))
+  copy_to_disk("/runner.lua", fs.combine(root, "payload/runner.lua"))
+  copy_to_disk("/pkg.lua", fs.combine(root, "payload/pkg.lua"))
+  copy_to_disk("/startup.lua", fs.combine(root, "payload/bootstrap.lua"))
+
+  local wf = fs.open(fs.combine(root, "startup.lua"), "w")
+  if wf then
+    wf.write(DISK_INSTALLER_STARTUP)
+    wf.close()
+  end
+
+  local cfg_payload = std.serialize_json({
+    url = cfg.url or "",
+    cf_id = cfg.cf_id or "",
+    cf_secret = cfg.cf_secret or "",
+    world = cfg.world or "overworld",
+    net = cfg.net_id or "main",
+  })
+  local cf = fs.open(fs.combine(root, "mesh_config.json"), "w")
+  if cf then
+    cf.write(cfg_payload)
+    cf.close()
+  end
+
+  pcall(peripheral.call, drive_name, "setDiskLabel", RUNNER_DISK_LABEL)
+  print("[gateway] Provisioned runner installer floppy on " .. drive_name .. " (" .. root .. ")")
+  return true
+end
+
+local function provision_all_runner_disks(cfg)
+  if read_setting("mcp.auto_provision_disk", "cc_mesh.auto_provision_disk", true) == false then
+    return 0
+  end
+  if type(peripheral) ~= "table" or type(peripheral.getNames) ~= "function" then
+    return 0
+  end
+  local count = 0
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "drive" then
+      if provision_runner_disk(name, cfg) then
+        count = count + 1
+      end
+    end
+  end
+  return count
+end
+
 local function format_print_args(...)
   local n = select("#", ...)
   local parts = {}
@@ -128,19 +290,35 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
   local probe_timeout = tonumber(read_setting("mcp.probe_timeout", "cc_mesh.probe_timeout", 0.5)) or 0.5
 
   local runner_by_name = {}
+  local known_runners = {}
   local pending_rpc = {}
   local active_tasks = 0
   local has_pending_work = false
   local poll_in_flight = false
   local wake_during_poll = false
 
-  local function register_runner(id, r_label)
+  local function register_runner(id, r_label, is_turtle, announce)
     if not id then
       return
     end
+    local is_new = known_runners[id] == nil
+    known_runners[id] = { label = r_label, is_turtle = is_turtle == true }
     runner_by_name[tostring(id)] = id
     if type(r_label) == "string" and r_label ~= "" then
       runner_by_name[r_label] = id
+    end
+    if announce and is_new then
+      local r_name = (type(r_label) == "string" and r_label ~= "") and r_label or tostring(id)
+      send_ws(ws, {
+        type = "PERIPHERAL_ATTACHED",
+        net_id = net_id,
+        name = r_name,
+        kind = (is_turtle == true) and "turtle" or "runner",
+        type_name = (is_turtle == true) and "turtle" or "computer",
+        methods = { "run_lua", "fs_read", "fs_write" },
+        timestamp = now_ms(),
+      })
+      print("[gateway] Runner joined: " .. r_name .. " (#" .. tostring(id) .. ")")
     end
   end
 
@@ -154,11 +332,14 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
     return false
   end
 
+  -- Auto-provision any empty / CC-Mesh floppy disk on attached drives
+  provision_all_runner_disks(cfg)
+
   -- Initial topology probe & sync
   local topo = std.probe_network(probe_timeout)
   for i = 1, #topo.runners do
     local r = topo.runners[i]
-    register_runner(r.id, r.label)
+    register_runner(r.id, r.label, r.is_turtle, false)
   end
 
   send_ws(ws, {
@@ -204,10 +385,16 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
         trigger_poll()
       end
 
+    elseif ev == "disk" and type(p1) == "string" then
+      provision_runner_disk(p1, cfg)
+
     elseif ev == "peripheral" and type(p1) == "string" then
       if is_modem(p1) then
         pcall(rednet.open, p1)
       else
+        if peripheral.getType(p1) == "drive" then
+          provision_runner_disk(p1, cfg)
+        end
         local api = std.get_api(p1)
         send_ws(ws, {
           type = "PERIPHERAL_ATTACHED",
@@ -326,7 +513,7 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
               duration_ms = duration_ms,
             })
           elseif msg.type == "HERE" then
-            register_runner(tonumber(msg.id) or sender_id, msg.label)
+            register_runner(tonumber(msg.id) or sender_id, msg.label, msg.is_turtle == true, true)
           end
         elseif protocol == PUBSUB_PROTOCOL then
           if msg.type == "PUB" or msg.type == "SUB" or msg.type == "UNSUB" or msg.type == "KV_SET" or msg.type == "KV_GET" then
