@@ -174,6 +174,7 @@ describe("Stage 1: Edge Auth, Static App Store, D1/R2 Store, Recipes & Specs", (
         "gateway.lua",
         "runner.lua",
         "pkg.lua",
+        "make_disk.lua",
         "lib/std.lua",
         "lib/crypto.lua",
         "lib/mesh.lua",

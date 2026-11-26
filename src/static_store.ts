@@ -2,6 +2,7 @@ import bootstrapLua from "./lua/bootstrap.lua";
 import gatewayLua from "./lua/gateway.lua";
 import runnerLua from "./lua/runner.lua";
 import pkgLua from "./lua/pkg.lua";
+import makeDiskLua from "./lua/make_disk.lua";
 import stdLua from "./lua/lib/std.lua";
 import cryptoLua from "./lua/lib/crypto.lua";
 import meshLua from "./lua/lib/mesh.lua";
@@ -77,6 +78,7 @@ const CORE_LUA_FILES: Readonly<Record<string, string>> = {
   "gateway.lua": gatewayLua,
   "runner.lua": runnerLua,
   "pkg.lua": pkgLua,
+  "make_disk.lua": makeDiskLua,
   "lib/std.lua": stdLua,
   "lib/crypto.lua": cryptoLua,
   "lib/mesh.lua": meshLua,

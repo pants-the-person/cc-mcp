@@ -21,8 +21,32 @@ local function execute_sandboxed(lua_code, task_args)
     stdout_lines[#stdout_lines + 1] = format_print_args(...)
   end
 
+  local mesh_mod = nil
+  local ok_mesh, loaded_mesh = pcall(require, "lib.mesh")
+  if ok_mesh and type(loaded_mesh) == "table" then
+    mesh_mod = loaded_mesh
+  end
+
+  local cached_net = nil
+  local function get_net()
+    if not cached_net and mesh_mod then
+      cached_net = mesh_mod.connect()
+    end
+    return cached_net
+  end
+
+  local net_proxy = setmetatable({}, {
+    __index = function(_, k)
+      local n = get_net()
+      if not n then error("Encrypted mesh not configured on this runner", 2) end
+      return n[k]
+    end,
+  })
+
   local env = {
     std = std,
+    mesh = mesh_mod,
+    net = net_proxy,
     args = type(task_args) == "table" and task_args or {},
     print = captured_print,
     require = require,
@@ -72,16 +96,28 @@ local function is_modem(name)
   return false
 end
 
+local function get_node_pool()
+  if type(settings) == "table" and type(settings.get) == "function" then
+    local p = settings.get("mcp.pool") or settings.get("cc_mesh.pool")
+    if type(p) == "string" and p ~= "" then
+      return p
+    end
+  end
+  return (turtle ~= nil) and "turtle" or "compute"
+end
+
 local function main()
   std.open_all_modems()
   local label = get_node_label()
-  print("[runner] Started " .. label .. " (ID " .. tostring(os.getComputerID()) .. ")")
+  local pool = get_node_pool()
+  print("[runner] Started " .. label .. " (ID " .. tostring(os.getComputerID()) .. ", pool=" .. pool .. ")")
 
   -- Proactively announce presence to any already-running gateway on boot
   pcall(rednet.broadcast, {
     type = "HERE",
     id = os.getComputerID(),
     label = label,
+    pool = pool,
     is_turtle = (turtle ~= nil),
   }, RPC_PROTOCOL)
 
@@ -98,6 +134,7 @@ local function main()
           type = "HERE",
           id = os.getComputerID(),
           label = get_node_label(),
+          pool = get_node_pool(),
           is_turtle = (turtle ~= nil),
         }, RPC_PROTOCOL)
       elseif msg.type == "EXEC_TASK" and msg.task_id then

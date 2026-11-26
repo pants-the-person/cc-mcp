@@ -84,6 +84,32 @@ function mesh.save_config(cfg, path)
   return true, nil
 end
 
+function mesh.ensure_initialized(opts)
+  opts = type(opts) == "table" and opts or {}
+  local existing = mesh.load_config(opts.config_path)
+  if existing and existing.channel and existing.key and existing.key ~= "" then
+    return existing, false
+  end
+  local mesh_name = opts.mesh_name or "main"
+  local subnet = opts.subnet or mesh_name
+  local role = opts.role or "gateway"
+  local channel = tonumber(opts.channel)
+  if not channel then
+    channel = mesh.scan_quiet_channel({ listen_s = tonumber(opts.listen_s) or 0.5 })
+  end
+  local key = (type(opts.key) == "string" and opts.key ~= "") and opts.key or crypto.random_hex(32, opts.entropy)
+  local cfg = {
+    mesh_name = mesh_name,
+    subnet = subnet,
+    role = role,
+    channel = channel,
+    key = key,
+    ttl = tonumber(opts.ttl) or 4,
+  }
+  mesh.save_config(cfg, opts.config_path)
+  return cfg, true
+end
+
 -- ---------------------------------------------------------------------------
 -- Modem Discovery & Quiet Channel Scanner
 -- ---------------------------------------------------------------------------
@@ -487,6 +513,44 @@ function mesh.connect(opts)
       end
       return (cache[subnet_name] and cache[subnet_name].peripherals) or {}
     end,
+    _storage = function(timeout_s)
+      discover(timeout_s or 0.5)
+      local drives = {}
+      local inventories = {}
+      -- Include local peripherals on our own subnet too
+      local all_subnets = {}
+      for sname, sinfo in pairs(cache) do
+        all_subnets[sname] = sinfo.peripherals or {}
+      end
+      if not all_subnets[cfg.subnet] then
+        all_subnets[cfg.subnet] = mesh.scan_local_peripherals()
+      end
+      for sname, periphs in pairs(all_subnets) do
+        for pname, pinfo in pairs(periphs) do
+          local ptype = pinfo.type or ""
+          local types = type(pinfo.types) == "table" and pinfo.types or { ptype }
+          local is_drive, is_inv = false, false
+          for _, t in ipairs(types) do
+            if t == "drive" then is_drive = true end
+            if t == "inventory" or t:find("chest", 1, true) or t:find("barrel", 1, true) or t:find("storage", 1, true) or t:find("meBridge", 1, true) then
+              is_inv = true
+            end
+          end
+          if type(pinfo.methods) == "table" then
+            for _, m in ipairs(pinfo.methods) do
+              if m == "list" or m == "listItems" then is_inv = true end
+            end
+          end
+          if is_drive then
+            drives[#drives + 1] = { subnet = sname, name = pname, type = ptype, proxy = make_peripheral_proxy(sname, pname) }
+          end
+          if is_inv then
+            inventories[#inventories + 1] = { subnet = sname, name = pname, type = ptype, proxy = make_peripheral_proxy(sname, pname) }
+          end
+        end
+      end
+      return { drives = drives, inventories = inventories }
+    end,
     _wrap = function(subnet_name, periph_name)
       return make_peripheral_proxy(subnet_name, periph_name)
     end,
@@ -512,12 +576,13 @@ function mesh.wrap(subnet_name, periph_name, opts)
 end
 
 -- ---------------------------------------------------------------------------
--- Dual-Homed Encrypted Subnet Bridge Daemon (Wired <-> Ender/Wireless Relay)
+-- Dual-Homed Encrypted Subnet Bridge (Embeddable Handler + Standalone Daemon)
 -- ---------------------------------------------------------------------------
 
-function mesh.run_bridge(opts)
+function mesh.create_bridge_handler(opts)
   local cfg = resolve_cfg(opts)
   local my_subnet = cfg.subnet
+  local my_role = (type(opts) == "table" and opts.role) or cfg.role or "bridge"
   local channel = cfg.channel
   local on_event = type(opts) == "table" and opts.on_event or nil
 
@@ -547,6 +612,7 @@ function mesh.run_bridge(opts)
     local frame = build_wire_frame(cfg, {
       type = "MESH_ANNOUNCE",
       subnet = my_subnet,
+      role = my_role,
       bridge_id = computer_id(),
       peripherals = local_periphs,
       req_id = req_id,
@@ -560,6 +626,20 @@ function mesh.run_bridge(opts)
       modems = mesh.open_channel_on_all(channel)
       transmit_on_modems(modems, channel, frame)
     end
+  end
+
+  local function broadcast_discover()
+    local frame = build_wire_frame(cfg, {
+      type = "MESH_DISCOVER",
+      req_id = crypto.random_hex(8),
+      src_subnet = my_subnet,
+      src_id = computer_id(),
+      ts = now_ms(),
+    }, 0)
+    if not frame then return end
+    mark_seen(frame.id)
+    modems = mesh.open_channel_on_all(channel)
+    transmit_on_modems(modems, channel, frame)
   end
 
   local function relay_frame(raw_msg, incoming_modem)
@@ -626,18 +706,11 @@ function mesh.run_bridge(opts)
     end
   end
 
-  -- Initial announce on boot
-  broadcast_announce(nil, nil)
-  print(("[mesh] Subnet bridge '%s' online on ch %d (%d modems)"):format(my_subnet, channel, #modems))
-
-  while true do
-    local ev, p1, p2, _p3, p4 = os.pullEvent()
-
+  local function handle_event(ev, p1, p2, _p3, p4)
     if ev == "modem_message" and p2 == channel then
       local incoming_modem = p1
       local raw_msg = p4
       if type(raw_msg) == "table" and raw_msg._cc_mesh == 1 and mark_seen(raw_msg.id) then
-        -- Authenticate & decrypt BEFORE handling or relaying (drops tampered/wrong-key traffic!)
         local inner, dec_err = parse_wire_frame(cfg, raw_msg)
         if inner then
           if inner.type == "MESH_DISCOVER" then
@@ -647,6 +720,8 @@ function mesh.run_bridge(opts)
           elseif inner.type == "MESH_ANNOUNCE" then
             if type(inner.subnet) == "string" and inner.subnet ~= my_subnet then
               remote_subnets[inner.subnet] = {
+                subnet = inner.subnet,
+                role = inner.role or "bridge",
                 bridge_id = inner.bridge_id,
                 peripherals = inner.peripherals or {},
                 last_seen = now_ms(),
@@ -671,13 +746,13 @@ function mesh.run_bridge(opts)
             end
 
           elseif inner.type == "MESH_RPC_RESP" then
-            -- Relay response across wired <-> ender boundary toward requester
             relay_frame(raw_msg, incoming_modem)
           end
         elseif type(on_event) == "function" then
           pcall(on_event, "rejected", dec_err)
         end
       end
+      return true
 
     elseif ev == "peripheral" and type(p1) == "string" then
       if is_modem(p1) then
@@ -685,11 +760,69 @@ function mesh.run_bridge(opts)
         modems = mesh.open_channel_on_all(channel)
       end
       broadcast_announce(nil, nil)
+      return true
 
     elseif ev == "peripheral_detach" and type(p1) == "string" then
       modems = mesh.open_channel_on_all(channel)
       broadcast_announce(nil, nil)
+      return true
     end
+    return false
+  end
+
+  local function get_storage_pool()
+    local drives = {}
+    local inventories = {}
+    local function collect(sname, periphs)
+      for pname, pinfo in pairs(periphs or {}) do
+        local ptype = pinfo.type or ""
+        local types = type(pinfo.types) == "table" and pinfo.types or { ptype }
+        local is_drive, is_inv = false, false
+        for _, t in ipairs(types) do
+          if t == "drive" then is_drive = true end
+          if t == "inventory" or t:find("chest", 1, true) or t:find("barrel", 1, true) or t:find("storage", 1, true) or t:find("meBridge", 1, true) then
+            is_inv = true
+          end
+        end
+        if type(pinfo.methods) == "table" then
+          for _, m in ipairs(pinfo.methods) do
+            if m == "list" or m == "listItems" then is_inv = true end
+          end
+        end
+        if is_drive then drives[#drives + 1] = { subnet = sname, name = pname, type = ptype } end
+        if is_inv then inventories[#inventories + 1] = { subnet = sname, name = pname, type = ptype } end
+      end
+    end
+    collect(my_subnet, mesh.scan_local_peripherals())
+    for sname, sinfo in pairs(remote_subnets) do
+      collect(sname, sinfo.peripherals)
+    end
+    return { drives = drives, inventories = inventories }
+  end
+
+  return {
+    config = cfg,
+    channel = channel,
+    subnet = my_subnet,
+    modems = modems,
+    announce = function() broadcast_announce(nil, nil) end,
+    discover = broadcast_discover,
+    handle_event = handle_event,
+    get_remote_subnets = function() return remote_subnets end,
+    get_local_peripherals = function() return mesh.scan_local_peripherals() end,
+    get_storage_pool = get_storage_pool,
+  }
+end
+
+function mesh.run_bridge(opts)
+  local handler = mesh.create_bridge_handler(opts)
+  handler.announce()
+  handler.discover()
+  print(("[mesh] Subnet bridge '%s' online on ch %d (%d modems)"):format(handler.subnet, handler.channel, #handler.modems))
+
+  while true do
+    local ev, p1, p2, p3, p4 = os.pullEvent()
+    handler.handle_event(ev, p1, p2, p3, p4)
   end
 end
 

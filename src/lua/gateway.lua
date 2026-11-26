@@ -236,7 +236,7 @@ local function format_print_args(...)
   return table.concat(parts, "\t")
 end
 
-local function execute_local_task(lua_code, task_args)
+local function execute_local_task(lua_code, task_args, extra_globals)
   local stdout_lines = {}
   local function captured_print(...)
     stdout_lines[#stdout_lines + 1] = format_print_args(...)
@@ -248,6 +248,11 @@ local function execute_local_task(lua_code, task_args)
     print = captured_print,
     require = require,
   }
+  if type(extra_globals) == "table" then
+    for k, v in pairs(extra_globals) do
+      env[k] = v
+    end
+  end
   setmetatable(env, { __index = _G })
 
   local fn, compile_err = load(tostring(lua_code or ""), "gateway_task", "t", env)
@@ -291,18 +296,28 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
 
   local runner_by_name = {}
   local known_runners = {}
+  local runner_load = {}
   local pending_rpc = {}
   local active_tasks = 0
   local has_pending_work = false
   local poll_in_flight = false
   local wake_during_poll = false
 
-  local function register_runner(id, r_label, is_turtle, announce)
+  local function register_runner(id, r_label, is_turtle, announce, pool_name)
     if not id then
       return
     end
     local is_new = known_runners[id] == nil
-    known_runners[id] = { label = r_label, is_turtle = is_turtle == true }
+    local pool = (type(pool_name) == "string" and pool_name ~= "")
+      and pool_name
+      or ((is_turtle == true) and "turtle" or "compute")
+    known_runners[id] = {
+      id = id,
+      label = r_label or tostring(id),
+      is_turtle = is_turtle == true,
+      pool = pool,
+    }
+    runner_load[id] = runner_load[id] or 0
     runner_by_name[tostring(id)] = id
     if type(r_label) == "string" and r_label ~= "" then
       runner_by_name[r_label] = id
@@ -318,9 +333,136 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
         methods = { "run_lua", "fs_read", "fs_write" },
         timestamp = now_ms(),
       })
-      print("[gateway] Runner joined: " .. r_name .. " (#" .. tostring(id) .. ")")
+      print("[gateway] Runner joined: " .. r_name .. " (#" .. tostring(id) .. ", pool=" .. pool .. ")")
     end
   end
+
+  local function pick_pool_runner(pool_name)
+    local best_id = nil
+    local best_load = math.huge
+    for id, info in pairs(known_runners) do
+      if info.pool == pool_name or pool_name == "any" then
+        local ld = runner_load[id] or 0
+        if ld < best_load or (ld == best_load and (best_id == nil or id < best_id)) then
+          best_load = ld
+          best_id = id
+        end
+      end
+    end
+    return best_id
+  end
+
+  local function resolve_target_runner(target_key)
+    if target_key == "compute" or target_key == "pool:compute" then
+      return pick_pool_runner("compute")
+    elseif target_key == "turtle" or target_key == "pool:turtle" then
+      return pick_pool_runner("turtle")
+    elseif target_key:sub(1, 5) == "pool:" then
+      return pick_pool_runner(target_key:sub(6))
+    end
+    return runner_by_name[target_key] or tonumber(target_key)
+  end
+
+  -- Optional embedded encrypted multi-subnet mesh router (activates when /.mesh_net.json exists)
+  local mesh_mod = nil
+  local mesh_bridge = nil
+  if type(fs) == "table" and fs.exists("/.mesh_net.json") then
+    local ok_m, loaded_m = pcall(require, "lib.mesh")
+    if ok_m and type(loaded_m) == "table" then
+      mesh_mod = loaded_m
+      local mcfg = mesh_mod.load_config()
+      if mcfg and mcfg.channel and mcfg.key then
+        local ok_b, handler = pcall(mesh_mod.create_bridge_handler, {
+          mesh_name = mcfg.mesh_name,
+          subnet = mcfg.subnet or net_id,
+          role = "gateway",
+          channel = mcfg.channel,
+          key = mcfg.key,
+          ttl = mcfg.ttl,
+          on_event = function(kind, info)
+            if kind == "announce" and type(info) == "table" and type(info.subnet) == "string" then
+              for pname, pinfo in pairs(info.peripherals or {}) do
+                local ptype = (type(pinfo) == "table" and pinfo.type) or "unknown"
+                local pmethods = (type(pinfo) == "table" and pinfo.methods) or {}
+                send_ws(ws, {
+                  type = "PERIPHERAL_ATTACHED",
+                  net_id = net_id,
+                  name = info.subnet .. "." .. pname,
+                  kind = (ptype == "drive") and "drive" or "peripheral",
+                  type_name = ptype,
+                  methods = pmethods,
+                  probe = {
+                    name = info.subnet .. "." .. pname,
+                    subnet = info.subnet,
+                    remote_name = pname,
+                    type = ptype,
+                    type_name = ptype,
+                    types = (type(pinfo) == "table" and pinfo.types) or { ptype },
+                    methods = pmethods,
+                    present = true,
+                    metadata = { bridged_via = info.subnet, bridge_id = info.bridge_id },
+                  },
+                  timestamp = now_ms(),
+                })
+              end
+            end
+          end,
+        })
+        if ok_b and handler then
+          mesh_bridge = handler
+        end
+      end
+    end
+  end
+
+  local cached_net = nil
+  local function get_mesh_net()
+    if not cached_net and mesh_mod and mesh_bridge then
+      cached_net = mesh_mod.connect({
+        mesh_name = mesh_bridge.config.mesh_name,
+        subnet = mesh_bridge.subnet,
+        channel = mesh_bridge.channel,
+        key = mesh_bridge.config.key,
+        ttl = mesh_bridge.config.ttl,
+      })
+    end
+    return cached_net
+  end
+
+  local local_task_globals = {
+    mesh = mesh_mod,
+    net = setmetatable({}, {
+      __index = function(_, k)
+        local n = get_mesh_net()
+        if not n then error("Encrypted mesh not configured on gateway", 2) end
+        return n[k]
+      end,
+    }),
+    cluster = function()
+      local compute_list = {}
+      for id, info in pairs(known_runners) do
+        compute_list[#compute_list + 1] = {
+          id = id,
+          label = info.label,
+          pool = info.pool,
+          is_turtle = info.is_turtle,
+          active_tasks = runner_load[id] or 0,
+        }
+      end
+      return {
+        orchestrator = { id = computer_id, label = label, world = world, net_id = net_id },
+        mesh = mesh_bridge and {
+          mesh_name = mesh_bridge.config.mesh_name,
+          subnet = mesh_bridge.subnet,
+          channel = mesh_bridge.channel,
+          modems = mesh_bridge.modems,
+        } or nil,
+        remote_subnets = mesh_bridge and mesh_bridge.get_remote_subnets() or {},
+        compute_pool = compute_list,
+        storage_pool = mesh_bridge and mesh_bridge.get_storage_pool() or { drives = {}, inventories = {} },
+      }
+    end,
+  }
 
   local function is_local_target(target_node)
     if target_node == nil or target_node == "" or target_node == "gateway" then
@@ -351,6 +493,11 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
     timestamp = now_ms(),
   })
 
+  if mesh_bridge then
+    mesh_bridge.announce()
+    mesh_bridge.discover()
+  end
+
   local prev_clock_high = (type(rs) == "table" and type(rs.getInput) == "function" and rs.getInput(clock_side)) and true or false
   local fallback_timer = os.startTimer(fallback_interval)
 
@@ -368,9 +515,12 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
   end
 
   while true do
-    local ev, p1, p2, p3 = os.pullEvent()
+    local ev, p1, p2, p3, p4 = os.pullEvent()
 
-    if ev == "redstone" then
+    if ev == "modem_message" and mesh_bridge and p2 == mesh_bridge.channel then
+      mesh_bridge.handle_event(ev, p1, p2, p3, p4)
+
+    elseif ev == "redstone" then
       local high = (type(rs) == "table" and type(rs.getInput) == "function" and rs.getInput(clock_side)) and true or false
       local rising = high and (not prev_clock_high)
       prev_clock_high = high
@@ -389,6 +539,9 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
       provision_runner_disk(p1, cfg)
 
     elseif ev == "peripheral" and type(p1) == "string" then
+      if mesh_bridge then
+        mesh_bridge.handle_event(ev, p1)
+      end
       if is_modem(p1) then
         pcall(rednet.open, p1)
       else
@@ -409,6 +562,9 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
       end
 
     elseif ev == "peripheral_detach" and type(p1) == "string" then
+      if mesh_bridge then
+        mesh_bridge.handle_event(ev, p1)
+      end
       send_ws(ws, {
         type = "PERIPHERAL_DETACHED",
         net_id = net_id,
@@ -436,7 +592,7 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
             if type(task) == "table" and task.task_id then
               if is_local_target(task.target_node) then
                 local started = now_ms()
-                local ok, stdout, result, err = execute_local_task(task.lua_code, task.args)
+                local ok, stdout, result, err = execute_local_task(task.lua_code, task.args, local_task_globals)
                 send_ws(ws, {
                   type = "TASK_RESULT",
                   task_id = task.task_id,
@@ -449,9 +605,10 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
                 })
               else
                 local target_key = tostring(task.target_node)
-                local runner_id = runner_by_name[target_key] or tonumber(target_key)
+                local runner_id = resolve_target_runner(target_key)
                 if runner_id and type(rednet) == "table" then
                   active_tasks = active_tasks + 1
+                  runner_load[runner_id] = (runner_load[runner_id] or 0) + 1
                   pending_rpc[task.task_id] = {
                     runner_id = runner_id,
                     target_node = target_key,
@@ -500,6 +657,9 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
             if info then
               pending_rpc[msg.task_id] = nil
               active_tasks = math.max(0, active_tasks - 1)
+              if info.runner_id and runner_load[info.runner_id] then
+                runner_load[info.runner_id] = math.max(0, runner_load[info.runner_id] - 1)
+              end
               duration_ms = now_ms() - info.started_at
             end
             send_ws(ws, {
@@ -513,7 +673,7 @@ local function run_session(ws, ws_url, cfg, computer_id, label)
               duration_ms = duration_ms,
             })
           elseif msg.type == "HERE" then
-            register_runner(tonumber(msg.id) or sender_id, msg.label, msg.is_turtle == true, true)
+            register_runner(tonumber(msg.id) or sender_id, msg.label, msg.is_turtle == true, true, msg.pool)
           end
         elseif protocol == PUBSUB_PROTOCOL then
           if msg.type == "PUB" or msg.type == "SUB" or msg.type == "UNSUB" or msg.type == "KV_SET" or msg.type == "KV_GET" then

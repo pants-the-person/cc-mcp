@@ -54,6 +54,7 @@ local SRC_BOOTSTRAP     = mock_cc.read_disk_file("src/lua/bootstrap.lua")
 local SRC_GATEWAY       = mock_cc.read_disk_file("src/lua/gateway.lua")
 local SRC_RUNNER        = mock_cc.read_disk_file("src/lua/runner.lua")
 local SRC_PKG           = mock_cc.read_disk_file("src/lua/pkg.lua")
+local SRC_MAKE_DISK     = mock_cc.read_disk_file("src/lua/make_disk.lua")
 local SRC_SPIDER        = mock_cc.read_disk_file("src/lua/apps/spider.lua")
 local SRC_INV_MON       = mock_cc.read_disk_file("src/lua/apps/inv_mon.lua")
 local SRC_NET_DIAG      = mock_cc.read_disk_file("src/lua/apps/net_diag.lua")
@@ -1114,6 +1115,170 @@ run_test("apps/mesh_setup.lua generates encrypted floppy installer and joins rem
   assert_true(nether_pc:read_vfs("/lib/mesh.lua") ~= nil, "nether installed /lib/mesh.lua")
   assert_true(nether_pc:read_vfs("/subnet_bridge.lua") ~= nil, "nether installed /subnet_bridge.lua")
   assert_contains(nether_pc:read_vfs("/startup.lua"), "subnet_bridge.lua", "nether /startup.lua auto-starts bridge")
+end)
+
+-- ===========================================================================
+-- Test 13: Unified Cluster (make_disk 4-role floppy, embedded gateway mesh bridge -> DO, compute pool dispatch)
+-- ===========================================================================
+run_test("Unified cluster: make_disk builds 4-role floppy, gateway bridges main_nether to DO, and dispatches compute pool", function()
+  local world = mock_cc.new_world()
+  local BASE = "https://mesh.example.test"
+
+  -- 1. Orchestrator / Gateway on 'main'
+  local gw = world:new_computer({
+    id = 300,
+    label = "orchestrator",
+    settings = {
+      ["mcp.url"] = BASE,
+      ["mcp.cf_id"] = "cid_gw",
+      ["mcp.cf_secret"] = "csec_gw",
+      ["mcp.role"] = "gateway",
+      ["mcp.world"] = "overworld",
+      ["mcp.net"] = "main",
+      ["mcp.clock_side"] = "back",
+      ["mcp.probe_timeout"] = 0.2,
+      ["mcp.max_reconnects"] = 0,
+    },
+  })
+  gw:write_vfs("/lib/std.lua", SRC_STD)
+  gw:write_vfs("/lib/crypto.lua", SRC_CRYPTO)
+  gw:write_vfs("/lib/mesh.lua", SRC_MESH)
+  gw:write_vfs("/runner.lua", SRC_RUNNER)
+  gw:write_vfs("/pkg.lua", SRC_PKG)
+  gw:write_vfs("/subnet_bridge.lua", SRC_SUBNET_BRIDGE)
+  gw:write_vfs("/startup.lua", SRC_BOOTSTRAP)
+
+  world:attach_bus_modem(gw, "left", "cluster_wired_main", false)
+  world:attach_bus_modem(gw, "bottom", "cluster_ender", true)
+
+  local disk_label = nil
+  gw:attach_peripheral("right", { "drive" }, {
+    isDiskPresent = function() return true end,
+    hasData = function() return true end,
+    getMountPath = function() return "disk" end,
+    getDiskLabel = function() return disk_label end,
+    setDiskLabel = function(lbl) disk_label = lbl end,
+  })
+
+  -- Run `make_disk right --listen 0 --non-interactive` on orchestrator
+  local ok_md, mcfg = gw:run_script(SRC_MAKE_DISK, "make_disk.lua", "right", "--listen", "0", "--non-interactive")
+  assert_eq(ok_md, true, "make_disk succeeded")
+  assert_eq(disk_label, "CC-Mesh Node Installer (main)", "unified floppy label")
+  assert_true(gw:read_vfs("/.mesh_net.json") ~= nil, "orchestrator saved /.mesh_net.json")
+  assert_true(gw:read_vfs("/disk/install.lua") ~= nil, "floppy install.lua written")
+
+  -- Helper to copy floppy onto another computer
+  local function mount_floppy(target)
+    for path, content in pairs(gw.vfs_files) do
+      if path:sub(1, 5) == "disk/" then
+        target:write_vfs("/" .. path, content)
+      end
+    end
+    target.env.shell.getRunningProgram = function() return "disk/install.lua" end
+  end
+
+  -- 2. Provision a Compute Pool worker ('compute_1') from the floppy
+  local comp_worker = world:new_computer({ id = 301, label = "compute_1" })
+  mount_floppy(comp_worker)
+  comp_worker:run_script(comp_worker:read_vfs("/disk/install.lua"), "disk/install.lua", "--role", "compute", "--subnet", "main", "--no-start")
+  assert_eq(comp_worker.settings_store["mcp.pool"], "compute", "compute worker pool set")
+  assert_true(comp_worker:read_vfs("/.mesh_net.json") ~= nil, "compute worker got encrypted mesh config")
+  world:attach_bus_modem(comp_worker, "left", "cluster_wired_main", false)
+
+  -- 3. Provision a Remote Nether Bridge ('main_nether') from the SAME floppy
+  local nether_br = world:new_computer({ id = 302, label = "bridge_nether" })
+  mount_floppy(nether_br)
+  nether_br:run_script(nether_br:read_vfs("/disk/install.lua"), "disk/install.lua", "--role", "bridge", "--subnet", "main_nether", "--no-start")
+  world:attach_bus_modem(nether_br, "bottom", "cluster_ender", true)
+  nether_br:attach_peripheral("storage_0", { "minecraft:chest", "inventory" }, {
+    list = function()
+      return { [1] = { name = "minecraft:netherite_scrap", count = 8 } }
+    end,
+  })
+
+  -- Start compute worker, nether bridge, and unified gateway orchestrator
+  comp_worker:start_daemon(SRC_RUNNER, "compute_1.lua")
+  nether_br:start_daemon(SRC_SUBNET_BRIDGE, "nether_bridge.lua")
+  world:pump()
+
+  gw:start_daemon(SRC_GATEWAY, "gateway_orchestrator.lua")
+  world:pump()
+  world:advance_time(0.25)
+
+  assert_eq(#gw.ws_handles, 1, "orchestrator connected to DO WebSocket")
+  local ws = gw.ws_handles[1]
+
+  -- Verify gateway forwarded main_nether.storage_0 into DO via PERIPHERAL_ATTACHED!
+  local saw_nether_storage = false
+  for _, raw in ipairs(ws.sent_messages) do
+    local frame = mock_cc.json_decode(raw)
+    if frame and frame.type == "PERIPHERAL_ATTACHED" and frame.name == "main_nether.storage_0" then
+      saw_nether_storage = true
+    end
+  end
+  assert_true(saw_nether_storage, "gateway forwarded main_nether.storage_0 to DO for MCP visibility")
+
+  -- Dispatch a task targeting `compute` pool -> executes on compute_1 AND reads main_nether.storage_0.list() over encrypted mesh!
+  ws:reset_spies()
+  ws:inject_message({ type = "WAKE", net_id = "main", task_id = "t_pool_1" })
+  world:pump()
+  gw:pulse_redstone("back")
+  assert_eq(ws.send_count, 1, "POLL_QUEUE sent on clock pulse")
+
+  ws:reset_spies()
+  ws:inject_message({
+    type = "DISPATCH_BATCH",
+    net_id = "main",
+    has_more = false,
+    tasks = {
+      {
+        task_id = "t_pool_1",
+        target_node = "compute",
+        lua_code = [[
+          local items = net.main_nether.storage_0.list()
+          return { worker = os.getComputerLabel(), item = items[1].name, count = items[1].count }
+        ]],
+        args = {},
+      },
+    },
+  })
+  world:pump()
+
+  local task_res = ws:last_decoded()
+  assert_eq(task_res.type, "TASK_RESULT", "received TASK_RESULT from compute pool")
+  assert_eq(task_res.ok, true, "compute pool task succeeded: " .. tostring(task_res.error))
+  assert_eq(task_res.result.worker, "compute_1", "dispatched to compute pool worker compute_1")
+  assert_eq(task_res.result.item, "minecraft:netherite_scrap", "compute worker read Nether chest across encrypted mesh")
+  assert_eq(task_res.result.count, 8, "item count matched")
+
+  -- Also verify cluster() status tool on gateway returns mesh, remote_subnets, compute_pool, and storage_pool
+  ws:reset_spies()
+  ws:inject_message({ type = "WAKE", net_id = "main", task_id = "t_status_1" })
+  world:pump()
+  gw:pulse_redstone("back")
+  ws:reset_spies()
+  ws:inject_message({
+    type = "DISPATCH_BATCH",
+    net_id = "main",
+    has_more = false,
+    tasks = {
+      {
+        task_id = "t_status_1",
+        target_node = "gateway",
+        lua_code = "return cluster()",
+        args = {},
+      },
+    },
+  })
+  world:pump()
+
+  local status_res = ws:last_decoded()
+  assert_eq(status_res.ok, true, "cluster() succeeded")
+  assert_eq(status_res.result.mesh.channel, mcfg.channel, "cluster mesh channel matches")
+  assert_true(status_res.result.remote_subnets.main_nether ~= nil, "cluster lists main_nether subnet")
+  assert_eq(#status_res.result.compute_pool, 1, "cluster lists 1 compute pool worker")
+  assert_true(#status_res.result.storage_pool.drives >= 1, "cluster lists storage pool drives")
+  assert_true(#status_res.result.storage_pool.inventories >= 1, "cluster lists main_nether storage_0 in storage pool")
 end)
 
 -- ===========================================================================

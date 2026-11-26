@@ -326,10 +326,10 @@ const SEEDED_LEARNED_TOOLS: SeededToolSpec[] = [
       'local std = require("lib.std")',
       "local content = args.code",
       "if not content and args.slug then",
-      '  local base = settings.get("cc_mesh.url") or ""',
+      '  local base = settings.get("mcp.url") or settings.get("cc_mesh.url") or ""',
       "  local headers = {}",
-      '  local cid = settings.get("cc_mesh.cf_id")',
-      '  local csec = settings.get("cc_mesh.cf_secret")',
+      '  local cid = settings.get("mcp.cf_id") or settings.get("cc_mesh.cf_id")',
+      '  local csec = settings.get("mcp.cf_secret") or settings.get("cc_mesh.cf_secret")',
       "  if cid and csec then",
       '    headers["CF-Access-Client-Id"] = cid',
       '    headers["CF-Access-Client-Secret"] = csec',
@@ -350,6 +350,79 @@ const SEEDED_LEARNED_TOOLS: SeededToolSpec[] = [
       "f.write(content)",
       "f.close()",
       "return { installed = true, path = args.path, bytes = #content }",
+    ].join("\n"),
+  },
+  {
+    name: "mesh_status",
+    description:
+      "Inspect the unified CC-Mesh cluster on the gateway: encrypted mesh config, discovered remote subnets (Nether/End bridges), compute pool workers & load, and storage pool drives/inventories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        discover_timeout: {
+          type: "number",
+          description: "Optional seconds to actively refresh remote subnet discovery before returning.",
+        },
+        net_id: {
+          type: "string",
+          description: "Target gateway network ID (default: 'main').",
+        },
+        target_node: {
+          type: "string",
+          description: "Target node name (default: 'gateway').",
+        },
+      },
+    },
+    luaTemplate: [
+      "if args.discover_timeout and args.discover_timeout > 0 and net then",
+      "  pcall(function() net._discover(args.discover_timeout) end)",
+      "end",
+      'if type(cluster) == "function" then return cluster() end',
+      'local mesh = require("lib.mesh")',
+      "return { mesh = mesh.load_config(), storage_pool = net and net._storage(0.5) or nil }",
+    ].join("\n"),
+  },
+  {
+    name: "mesh_call",
+    description:
+      "Invoke any peripheral method on any remote subnet bridge (e.g. subnet='main_nether', peripheral='storage_0', method='list') over the encrypted wireless/ender mesh.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subnet: {
+          type: "string",
+          description: "Target subnet name (e.g. 'main_nether', 'main_end', 'main').",
+        },
+        peripheral: {
+          type: "string",
+          description: "Peripheral name on that subnet (e.g. 'storage_0').",
+        },
+        method: {
+          type: "string",
+          description: "Method name to invoke (e.g. 'list', 'getSize', 'pushItems').",
+        },
+        args: {
+          type: "array",
+          description: "Positional arguments array to pass to the peripheral method.",
+          items: {},
+        },
+        net_id: {
+          type: "string",
+          description: "Target gateway network ID (default: 'main').",
+        },
+        target_node: {
+          type: "string",
+          description: "Target node name (default: 'gateway').",
+        },
+      },
+      required: ["subnet", "peripheral", "method"],
+    },
+    luaTemplate: [
+      'local call_args = type(args.args) == "table" and args.args or {}',
+      "local unpack_fn = table.unpack or unpack",
+      "local rets = { net._call(args.subnet, args.peripheral, args.method, unpack_fn(call_args)) }",
+      "if #rets <= 1 then return rets[1] end",
+      "return rets",
     ].join("\n"),
   },
 ];

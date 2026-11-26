@@ -196,6 +196,8 @@ local function sync_and_boot()
       }
       if role == "gateway" then
         sync_targets[#sync_targets + 1] = { key = "runner.lua", dest = "/runner.lua" }
+        sync_targets[#sync_targets + 1] = { key = "make_disk.lua", dest = "/make_disk.lua" }
+        sync_targets[#sync_targets + 1] = { key = "apps/subnet_bridge.lua", dest = "/subnet_bridge.lua" }
       end
 
       local updated_count = 0
@@ -226,6 +228,23 @@ local function sync_and_boot()
         write_file(MANIFEST_PATH, textutils.serialiseJSON(local_manifest))
       end
       print("[bootstrap] Sync complete (" .. tostring(updated_count) .. " updated)")
+    end
+  end
+
+  -- Auto-initialize encrypted multi-subnet mesh on the main gateway node
+  if role == "gateway" and fs.exists("/lib/mesh.lua") and not fs.exists("/.mesh_net.json") then
+    local ok_m, mesh_mod = pcall(require, "lib.mesh")
+    if ok_m and type(mesh_mod) == "table" and type(mesh_mod.ensure_initialized) == "function" then
+      local net_name = get_setting("mcp.net", "cc_mesh.net", "main")
+      local ok_init, mcfg, created = pcall(mesh_mod.ensure_initialized, {
+        mesh_name = net_name,
+        subnet = net_name,
+        role = "gateway",
+        listen_s = 0.4,
+      })
+      if ok_init and created and type(mcfg) == "table" then
+        print(("[bootstrap] Initialized encrypted mesh '%s' on ch %d (run `make_disk` to build node floppies)"):format(tostring(mcfg.mesh_name), tonumber(mcfg.channel) or 0))
+      end
     end
   end
 

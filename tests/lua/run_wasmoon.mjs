@@ -12,6 +12,7 @@ const FILES_TO_MOUNT = [
   "src/lua/gateway.lua",
   "src/lua/runner.lua",
   "src/lua/pkg.lua",
+  "src/lua/make_disk.lua",
   "src/lua/apps/spider.lua",
   "src/lua/apps/inv_mon.lua",
   "src/lua/apps/net_diag.lua",
